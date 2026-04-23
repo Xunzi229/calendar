@@ -1,6 +1,7 @@
 import { app, BrowserWindow, Menu, ipcMain, screen } from 'electron'
 import path from 'node:path'
 import { AlmanacService } from './almanac/almanacService'
+import type { ClockSnapshot } from '../shared/clock/types'
 
 Menu.setApplicationMenu(null)
 
@@ -12,10 +13,31 @@ let calendarWindowSize = {
   width: 760,
   height: 552,
 }
+let clockWatchdog: NodeJS.Timeout | null = null
 
 const almanacService = new AlmanacService()
 const LAUNCHER_SIZE = 62
 const WINDOW_MARGIN = 12
+const CLOCK_WATCHDOG_INTERVAL = 250
+const WM_TIMECHANGE = 0x001e
+const WM_SETTINGCHANGE = 0x001a
+
+let lastClockSnapshot = readClockSnapshot()
+
+function readClockSnapshot(): ClockSnapshot {
+  const now = new Date()
+
+  return {
+    iso: now.toISOString(),
+    dateKey: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`,
+    timezoneOffset: now.getTimezoneOffset(),
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+  }
+}
+
+function hasClockSnapshotChanged(next: ClockSnapshot, previous: ClockSnapshot): boolean {
+  return next.dateKey !== previous.dateKey || next.timezoneOffset !== previous.timezoneOffset || next.timeZone !== previous.timeZone
+}
 
 function getWorkArea(): Electron.Rectangle {
   const point = launcherWindow?.getBounds() ?? screen.getCursorScreenPoint()
@@ -78,6 +100,53 @@ function hideCalendarWindow(): void {
   mainWindow?.hide()
 }
 
+function broadcastClockChanged(snapshot: ClockSnapshot): void {
+  launcherWindow?.webContents.send('clock:changed', snapshot)
+  mainWindow?.webContents.send('clock:changed', snapshot)
+}
+
+function refreshClock(force = false): void {
+  const nextSnapshot = readClockSnapshot()
+
+  if (force || hasClockSnapshotChanged(nextSnapshot, lastClockSnapshot)) {
+    lastClockSnapshot = nextSnapshot
+    broadcastClockChanged(nextSnapshot)
+  }
+}
+
+function startClockWatchdog(): void {
+  if (clockWatchdog) {
+    clearInterval(clockWatchdog)
+  }
+
+  clockWatchdog = setInterval(() => {
+    refreshClock()
+  }, CLOCK_WATCHDOG_INTERVAL)
+}
+
+function stopClockWatchdog(): void {
+  if (!clockWatchdog) {
+    return
+  }
+
+  clearInterval(clockWatchdog)
+  clockWatchdog = null
+}
+
+function watchWindowClockMessages(window: BrowserWindow): void {
+  if (process.platform !== 'win32') {
+    return
+  }
+
+  window.hookWindowMessage(WM_TIMECHANGE, () => {
+    refreshClock(true)
+  })
+
+  window.hookWindowMessage(WM_SETTINGCHANGE, () => {
+    refreshClock(true)
+  })
+}
+
 function showConfigWindow(): void {
   if (configWindow) {
     configWindow.show()
@@ -86,6 +155,7 @@ function showConfigWindow(): void {
   }
 
   const currentKey = almanacService.getApiKey()
+  const escapedKey = currentKey.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 
   configWindow = new BrowserWindow({
     width: 360,
@@ -99,6 +169,7 @@ function showConfigWindow(): void {
     webPreferences: {
       contextIsolation: false,
       nodeIntegration: true,
+      backgroundThrottling: false,
     },
   })
 
@@ -160,8 +231,8 @@ function showConfigWindow(): void {
       </head>
       <body>
         <h1>配置 TianAPI Key</h1>
-        <p>未配置或 Key 异常时，底部黄历区域将自动隐藏，不显示空白占位。</p>
-        <input id="api-key" value="${currentKey}" placeholder="请输入 TianAPI Key" />
+        <p>未配置或 Key 异常时，底部黄历区域会自动隐藏，不显示空白占位。</p>
+        <input id="api-key" value="${escapedKey}" placeholder="请输入 TianAPI Key" />
         <div class="actions">
           <button id="clear-key">清除</button>
           <button id="save-key" class="primary">保存</button>
@@ -273,68 +344,59 @@ function createLauncherHtml(): string {
           const monthElement = document.getElementById('launcher-month')
           const dayElement = document.getElementById('launcher-day')
           const openButton = document.getElementById('open-calendar')
-          let midnightTimer = null
-          let watchdogTimer = null
-          let lastTimezoneOffset = new Date().getTimezoneOffset()
-          let lastTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
-          let lastNow = Date.now()
+          let lastClockKey = ''
+          let pollTimer = null
 
-          function refreshLauncherDate() {
-            const now = new Date()
+          function refreshLauncherDate(snapshot) {
+            const now = snapshot ? new Date(snapshot.iso) : new Date()
             monthElement.textContent = String(now.getMonth() + 1) + '月'
             dayElement.textContent = String(now.getDate())
             openButton.setAttribute('aria-label', '显示日历 ' + monthElement.textContent + dayElement.textContent)
-            lastTimezoneOffset = now.getTimezoneOffset()
-            lastTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
-            lastNow = Date.now()
+            lastClockKey = [snapshot?.iso || now.toISOString(), snapshot?.timezoneOffset ?? now.getTimezoneOffset(), snapshot?.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || ''].join('|')
           }
 
-          function scheduleMidnightRefresh() {
-            if (midnightTimer) {
-              clearTimeout(midnightTimer)
+          function syncClockSnapshot(snapshot) {
+            if (!snapshot) {
+              return
             }
 
-            const now = new Date()
-            const nextMidnight = new Date(now)
-            nextMidnight.setHours(24, 0, 0, 50)
-            midnightTimer = setTimeout(() => {
-              refreshLauncherDate()
-              scheduleMidnightRefresh()
-            }, Math.max(100, nextMidnight.getTime() - now.getTime()))
+            const nextClockKey = [snapshot.iso, snapshot.timezoneOffset, snapshot.timeZone].join('|')
+
+            if (nextClockKey !== lastClockKey) {
+              refreshLauncherDate(snapshot)
+            }
           }
 
-          function startClockWatchdog() {
-            if (watchdogTimer) {
-              clearInterval(watchdogTimer)
+          function startClockPolling() {
+            if (pollTimer) {
+              clearInterval(pollTimer)
             }
 
-            watchdogTimer = setInterval(() => {
-              const now = new Date()
-              const currentTimestamp = Date.now()
-              const currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
-              const clockJumped = Math.abs(currentTimestamp - lastNow - 15000) > 4000
-              const dayChanged = monthElement.textContent !== String(now.getMonth() + 1) + '月' || dayElement.textContent !== String(now.getDate())
-              const timezoneChanged = now.getTimezoneOffset() !== lastTimezoneOffset || currentTimeZone !== lastTimeZone
-
-              if (clockJumped || dayChanged || timezoneChanged) {
-                refreshLauncherDate()
-                scheduleMidnightRefresh()
-              } else {
-                lastNow = currentTimestamp
-              }
-            }, 15000)
+            pollTimer = setInterval(() => {
+              ipcRenderer.invoke('clock:get').then((snapshot) => {
+                syncClockSnapshot(snapshot)
+              })
+            }, 250)
           }
 
           document.addEventListener('contextmenu', (event) => {
             event.preventDefault()
             ipcRenderer.send('calendar:launcher-menu')
           })
+
           openButton.addEventListener('click', () => {
             ipcRenderer.send('calendar:show')
           })
-          refreshLauncherDate()
-          scheduleMidnightRefresh()
-          startClockWatchdog()
+
+          ipcRenderer.on('clock:changed', (_event, snapshot) => {
+            syncClockSnapshot(snapshot)
+          })
+
+          ipcRenderer.invoke('clock:get').then((snapshot) => {
+            syncClockSnapshot(snapshot)
+          })
+
+          startClockPolling()
         </script>
       </body>
     </html>
@@ -358,6 +420,7 @@ function createLauncherWindow(): void {
     webPreferences: {
       contextIsolation: false,
       nodeIntegration: true,
+      backgroundThrottling: false,
     },
   })
 
@@ -366,7 +429,11 @@ function createLauncherWindow(): void {
   })
 
   launcherWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(createLauncherHtml())}`)
+  launcherWindow.webContents.once('did-finish-load', () => {
+    refreshClock(true)
+  })
   launcherWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: false })
+  watchWindowClockMessages(launcherWindow)
   positionLauncherWindow()
   launcherWindow.show()
 }
@@ -387,6 +454,7 @@ function createCalendarWindow(): void {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   })
 
@@ -405,7 +473,11 @@ function createCalendarWindow(): void {
     mainWindow = null
   })
 
+  watchWindowClockMessages(mainWindow)
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
+  mainWindow.webContents.once('did-finish-load', () => {
+    refreshClock(true)
+  })
 }
 
 ipcMain.on('calendar:show', () => {
@@ -432,12 +504,15 @@ ipcMain.on('calendar:resize', (_event, size: { width?: number; height?: number }
   positionCalendarWindow()
 })
 
+ipcMain.handle('clock:get', async () => {
+  const snapshot = readClockSnapshot()
+  lastClockSnapshot = snapshot
+  return snapshot
+})
+
 ipcMain.handle('settings:set-api-key', async (_event, value: string) => {
   almanacService.setApiKey(value)
-
-  if (mainWindow) {
-    mainWindow.webContents.send('almanac:updated', null)
-  }
+  mainWindow?.webContents.send('almanac:updated', null)
 })
 
 ipcMain.handle('almanac:get', async (_event, date: string) => {
@@ -445,14 +520,14 @@ ipcMain.handle('almanac:get', async (_event, date: string) => {
 })
 
 almanacService.on('updated', (record) => {
-  if (mainWindow) {
-    mainWindow.webContents.send('almanac:updated', record)
-  }
+  mainWindow?.webContents.send('almanac:updated', record)
 })
 
 app.whenReady().then(() => {
   createCalendarWindow()
   createLauncherWindow()
+  startClockWatchdog()
+  refreshClock(true)
 
   screen.on('display-metrics-changed', () => {
     positionLauncherWindow()
@@ -466,6 +541,7 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   isQuitting = true
+  stopClockWatchdog()
 })
 
 app.on('window-all-closed', () => {

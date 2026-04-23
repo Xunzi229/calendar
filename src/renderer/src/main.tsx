@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { AlmanacRecord } from '../../shared/almanac/types'
+import type { ClockSnapshot } from '../../shared/clock/types'
 import './styles.css'
 
 type DayKind = 'normal' | 'holiday' | 'workday' | 'muted'
@@ -310,8 +311,13 @@ function getResolvedTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''
 }
 
+function toClockDate(snapshot: ClockSnapshot): Date {
+  return new Date(snapshot.iso)
+}
+
 function CalendarApp(): React.ReactElement {
   const calendarWindowRef = useRef<HTMLElement | null>(null)
+  const lastClockSnapshotRef = useRef<ClockSnapshot | null>(null)
   const [now, setNow] = useState(() => new Date())
   const [viewYear, setViewYear] = useState(() => new Date().getFullYear())
   const [viewMonth, setViewMonth] = useState(() => new Date().getMonth() + 1)
@@ -324,17 +330,56 @@ function CalendarApp(): React.ReactElement {
   const [yearWindow, setYearWindow] = useState({ start: currentYear - 4, end: currentYear + 6 })
   const [almanacRecord, setAlmanacRecord] = useState<AlmanacRecord | null>(null)
   const previousTodayKeyRef = useRef(formatDate(now))
-  const lastWatchRef = useRef({
-    timestamp: Date.now(),
-    timezoneOffset: now.getTimezoneOffset(),
-    timeZone: getResolvedTimeZone(),
-  })
 
   const holidayMap = useMemo(() => buildHolidayMap(viewYear), [viewYear])
   const days = useMemo(() => buildMonthDays(viewYear, viewMonth, holidayMap, now), [holidayMap, now, viewMonth, viewYear])
   const selectedText = getDisplayText(selectedDate, holidayMap)
   const countdown = getCountdown(selectedDate, holidayMap)
   const visibleYears = useMemo(() => buildYearWindow(yearWindow.start, yearWindow.end), [yearWindow])
+
+  useEffect(() => {
+    let cancelled = false
+    let pollTimer = 0
+
+    const syncClockSnapshot = (snapshot: ClockSnapshot): void => {
+      const previous = lastClockSnapshotRef.current
+
+      if (
+        !previous ||
+        previous.iso !== snapshot.iso ||
+        previous.dateKey !== snapshot.dateKey ||
+        previous.timezoneOffset !== snapshot.timezoneOffset ||
+        previous.timeZone !== snapshot.timeZone
+      ) {
+        lastClockSnapshotRef.current = snapshot
+        setNow(toClockDate(snapshot))
+      }
+    }
+
+    void window.calendarApi.getClockSnapshot().then((snapshot) => {
+      if (!cancelled) {
+        syncClockSnapshot(snapshot)
+      }
+    })
+
+    const unsubscribe = window.calendarApi.onClockChanged((snapshot) => {
+      syncClockSnapshot(snapshot)
+    })
+
+    pollTimer = window.setInterval(() => {
+      void window.calendarApi.getClockSnapshot().then((snapshot) => {
+        if (!cancelled) {
+          syncClockSnapshot(snapshot)
+        }
+      })
+    }, 250)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(pollTimer)
+      unsubscribe()
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -392,62 +437,6 @@ function CalendarApp(): React.ReactElement {
       }
     })
   }, [selectedDate])
-
-  useEffect(() => {
-    let midnightTimer = 0
-
-    const scheduleMidnightRefresh = (): void => {
-      window.clearTimeout(midnightTimer)
-
-      const current = new Date()
-      const nextMidnight = new Date(current)
-      nextMidnight.setHours(24, 0, 0, 50)
-
-      midnightTimer = window.setTimeout(() => {
-        const nextNow = new Date()
-        lastWatchRef.current = {
-          timestamp: Date.now(),
-          timezoneOffset: nextNow.getTimezoneOffset(),
-          timeZone: getResolvedTimeZone(),
-        }
-        setNow(nextNow)
-        scheduleMidnightRefresh()
-      }, Math.max(100, nextMidnight.getTime() - current.getTime()))
-    }
-
-    const watchdogTimer = window.setInterval(() => {
-      const nextNow = new Date()
-      const currentTimestamp = Date.now()
-      const currentTimeZone = getResolvedTimeZone()
-      const previous = lastWatchRef.current
-      const clockJumped = Math.abs(currentTimestamp - previous.timestamp - 15000) > 4000
-      const timezoneChanged = nextNow.getTimezoneOffset() !== previous.timezoneOffset || currentTimeZone !== previous.timeZone
-      const dayChanged = formatDate(nextNow) !== formatDate(now)
-
-      if (clockJumped || timezoneChanged || dayChanged) {
-        lastWatchRef.current = {
-          timestamp: currentTimestamp,
-          timezoneOffset: nextNow.getTimezoneOffset(),
-          timeZone: currentTimeZone,
-        }
-        setNow(nextNow)
-        scheduleMidnightRefresh()
-      } else {
-        lastWatchRef.current = {
-          timestamp: currentTimestamp,
-          timezoneOffset: nextNow.getTimezoneOffset(),
-          timeZone: currentTimeZone,
-        }
-      }
-    }, 15000)
-
-    scheduleMidnightRefresh()
-
-    return () => {
-      window.clearTimeout(midnightTimer)
-      window.clearInterval(watchdogTimer)
-    }
-  }, [now])
 
   useEffect(() => {
     const previousTodayKey = previousTodayKeyRef.current
