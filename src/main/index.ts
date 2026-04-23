@@ -1,14 +1,19 @@
 import { app, BrowserWindow, Menu, ipcMain, screen } from 'electron'
 import path from 'node:path'
+import { AlmanacService } from './almanac/almanacService'
 
 Menu.setApplicationMenu(null)
 
 let mainWindow: BrowserWindow | null = null
 let launcherWindow: BrowserWindow | null = null
+let configWindow: BrowserWindow | null = null
 let isQuitting = false
+let calendarWindowSize = {
+  width: 760,
+  height: 552,
+}
 
-const CALENDAR_WIDTH = 790
-const CALENDAR_HEIGHT = 690
+const almanacService = new AlmanacService()
 const LAUNCHER_SIZE = 62
 const WINDOW_MARGIN = 12
 
@@ -41,12 +46,16 @@ function positionCalendarWindow(): void {
   const { x, y, width, height } = getWorkArea()
   const bottomSpace = LAUNCHER_SIZE + WINDOW_MARGIN * 2
   const availableTop = y + WINDOW_MARGIN
-  const preferredY = y + height - CALENDAR_HEIGHT - bottomSpace
+  const maxWidth = Math.max(360, width - WINDOW_MARGIN * 2)
+  const maxHeight = Math.max(240, height - bottomSpace - WINDOW_MARGIN)
+  const nextWidth = Math.min(calendarWindowSize.width, maxWidth)
+  const nextHeight = Math.min(calendarWindowSize.height, maxHeight)
+  const preferredY = y + height - nextHeight - bottomSpace
 
   mainWindow.setBounds({
-    width: CALENDAR_WIDTH,
-    height: CALENDAR_HEIGHT,
-    x: Math.round(x + width - CALENDAR_WIDTH - WINDOW_MARGIN),
+    width: nextWidth,
+    height: nextHeight,
+    x: Math.round(x + width - nextWidth - WINDOW_MARGIN),
     y: Math.round(Math.max(availableTop, preferredY)),
   })
 }
@@ -69,6 +78,113 @@ function hideCalendarWindow(): void {
   mainWindow?.hide()
 }
 
+function showConfigWindow(): void {
+  if (configWindow) {
+    configWindow.show()
+    configWindow.focus()
+    return
+  }
+
+  const currentKey = almanacService.getApiKey()
+
+  configWindow = new BrowserWindow({
+    width: 360,
+    height: 214,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    autoHideMenuBar: true,
+    title: '配置 TianAPI Key',
+    alwaysOnTop: true,
+    webPreferences: {
+      contextIsolation: false,
+      nodeIntegration: true,
+    },
+  })
+
+  configWindow.on('closed', () => {
+    configWindow = null
+  })
+
+  const html = `
+    <!doctype html>
+    <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8" />
+        <style>
+          body {
+            margin: 0;
+            padding: 18px;
+            font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+            color: #172033;
+            background: #f6f9fc;
+          }
+          h1 {
+            margin: 0 0 10px;
+            font-size: 16px;
+          }
+          p {
+            margin: 0 0 12px;
+            color: #667085;
+            font-size: 13px;
+            line-height: 1.5;
+          }
+          input {
+            width: 100%;
+            height: 36px;
+            padding: 0 12px;
+            border: 1px solid #d8dee7;
+            border-radius: 8px;
+            box-sizing: border-box;
+          }
+          .actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 14px;
+          }
+          button {
+            min-width: 84px;
+            height: 34px;
+            border: 1px solid #d8dee7;
+            border-radius: 8px;
+            background: #ffffff;
+            cursor: pointer;
+          }
+          .primary {
+            background: #5b6cff;
+            border-color: #5b6cff;
+            color: #ffffff;
+          }
+        </style>
+      </head>
+      <body>
+        <h1>配置 TianAPI Key</h1>
+        <p>未配置或 Key 异常时，底部黄历区域将自动隐藏，不显示空白占位。</p>
+        <input id="api-key" value="${currentKey}" placeholder="请输入 TianAPI Key" />
+        <div class="actions">
+          <button id="clear-key">清除</button>
+          <button id="save-key" class="primary">保存</button>
+        </div>
+        <script>
+          const { ipcRenderer } = require('electron')
+          const input = document.getElementById('api-key')
+          document.getElementById('save-key').addEventListener('click', async () => {
+            await ipcRenderer.invoke('settings:set-api-key', input.value || '')
+            window.close()
+          })
+          document.getElementById('clear-key').addEventListener('click', async () => {
+            await ipcRenderer.invoke('settings:set-api-key', '')
+            window.close()
+          })
+        </script>
+      </body>
+    </html>
+  `
+
+  configWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+}
+
 function showLauncherMenu(): void {
   if (!launcherWindow) {
     return
@@ -83,6 +199,10 @@ function showLauncherMenu(): void {
       label: '隐藏日历',
       click: hideCalendarWindow,
     },
+    {
+      label: '配置 TianAPI Key',
+      click: showConfigWindow,
+    },
     { type: 'separator' },
     {
       label: '退出',
@@ -95,18 +215,13 @@ function showLauncherMenu(): void {
 }
 
 function createLauncherHtml(): string {
-  const now = new Date()
-  const month = String(now.getMonth() + 1)
-  const day = String(now.getDate())
-
   return `
     <!doctype html>
     <html lang="zh-CN">
       <head>
         <meta charset="UTF-8" />
         <style>
-          html,
-          body {
+          html, body {
             width: 100%;
             height: 100%;
             margin: 0;
@@ -115,7 +230,6 @@ function createLauncherHtml(): string {
             font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
             user-select: none;
           }
-
           button {
             width: 58px;
             height: 58px;
@@ -130,7 +244,6 @@ function createLauncherHtml(): string {
             cursor: pointer;
             padding: 0;
           }
-
           .month {
             display: grid;
             place-items: center;
@@ -140,7 +253,6 @@ function createLauncherHtml(): string {
             font-weight: 700;
             line-height: 1;
           }
-
           .day {
             display: grid;
             place-items: center;
@@ -153,18 +265,76 @@ function createLauncherHtml(): string {
       </head>
       <body>
         <button id="open-calendar" aria-label="显示日历">
-          <span class="month">${month}月</span>
-          <span class="day">${day}</span>
+          <span id="launcher-month" class="month"></span>
+          <span id="launcher-day" class="day"></span>
         </button>
         <script>
           const { ipcRenderer } = require('electron')
+          const monthElement = document.getElementById('launcher-month')
+          const dayElement = document.getElementById('launcher-day')
+          const openButton = document.getElementById('open-calendar')
+          let midnightTimer = null
+          let watchdogTimer = null
+          let lastTimezoneOffset = new Date().getTimezoneOffset()
+          let lastTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+          let lastNow = Date.now()
+
+          function refreshLauncherDate() {
+            const now = new Date()
+            monthElement.textContent = String(now.getMonth() + 1) + '月'
+            dayElement.textContent = String(now.getDate())
+            openButton.setAttribute('aria-label', '显示日历 ' + monthElement.textContent + dayElement.textContent)
+            lastTimezoneOffset = now.getTimezoneOffset()
+            lastTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+            lastNow = Date.now()
+          }
+
+          function scheduleMidnightRefresh() {
+            if (midnightTimer) {
+              clearTimeout(midnightTimer)
+            }
+
+            const now = new Date()
+            const nextMidnight = new Date(now)
+            nextMidnight.setHours(24, 0, 0, 50)
+            midnightTimer = setTimeout(() => {
+              refreshLauncherDate()
+              scheduleMidnightRefresh()
+            }, Math.max(100, nextMidnight.getTime() - now.getTime()))
+          }
+
+          function startClockWatchdog() {
+            if (watchdogTimer) {
+              clearInterval(watchdogTimer)
+            }
+
+            watchdogTimer = setInterval(() => {
+              const now = new Date()
+              const currentTimestamp = Date.now()
+              const currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+              const clockJumped = Math.abs(currentTimestamp - lastNow - 15000) > 4000
+              const dayChanged = monthElement.textContent !== String(now.getMonth() + 1) + '月' || dayElement.textContent !== String(now.getDate())
+              const timezoneChanged = now.getTimezoneOffset() !== lastTimezoneOffset || currentTimeZone !== lastTimeZone
+
+              if (clockJumped || dayChanged || timezoneChanged) {
+                refreshLauncherDate()
+                scheduleMidnightRefresh()
+              } else {
+                lastNow = currentTimestamp
+              }
+            }, 15000)
+          }
+
           document.addEventListener('contextmenu', (event) => {
             event.preventDefault()
             ipcRenderer.send('calendar:launcher-menu')
           })
-          document.getElementById('open-calendar').addEventListener('click', () => {
+          openButton.addEventListener('click', () => {
             ipcRenderer.send('calendar:show')
           })
+          refreshLauncherDate()
+          scheduleMidnightRefresh()
+          startClockWatchdog()
         </script>
       </body>
     </html>
@@ -203,10 +373,8 @@ function createLauncherWindow(): void {
 
 function createCalendarWindow(): void {
   mainWindow = new BrowserWindow({
-    width: CALENDAR_WIDTH,
-    height: CALENDAR_HEIGHT,
-    minWidth: 760,
-    minHeight: 640,
+    width: calendarWindowSize.width,
+    height: calendarWindowSize.height,
     frame: false,
     resizable: false,
     skipTaskbar: true,
@@ -216,6 +384,7 @@ function createCalendarWindow(): void {
     show: false,
     title: 'Calendar',
     webPreferences: {
+      preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
@@ -245,6 +414,40 @@ ipcMain.on('calendar:show', () => {
 
 ipcMain.on('calendar:launcher-menu', () => {
   showLauncherMenu()
+})
+
+ipcMain.on('calendar:resize', (_event, size: { width?: number; height?: number }) => {
+  const nextWidth = Math.max(720, Math.ceil(size.width ?? calendarWindowSize.width))
+  const nextHeight = Math.max(360, Math.ceil(size.height ?? calendarWindowSize.height))
+
+  if (nextWidth === calendarWindowSize.width && nextHeight === calendarWindowSize.height) {
+    return
+  }
+
+  calendarWindowSize = {
+    width: nextWidth,
+    height: nextHeight,
+  }
+
+  positionCalendarWindow()
+})
+
+ipcMain.handle('settings:set-api-key', async (_event, value: string) => {
+  almanacService.setApiKey(value)
+
+  if (mainWindow) {
+    mainWindow.webContents.send('almanac:updated', null)
+  }
+})
+
+ipcMain.handle('almanac:get', async (_event, date: string) => {
+  return almanacService.getAlmanac(date)
+})
+
+almanacService.on('updated', (record) => {
+  if (mainWindow) {
+    mainWindow.webContents.send('almanac:updated', record)
+  }
 })
 
 app.whenReady().then(() => {

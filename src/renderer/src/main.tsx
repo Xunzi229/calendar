@@ -1,5 +1,6 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import type { AlmanacRecord } from '../../shared/almanac/types'
 import './styles.css'
 
 type DayKind = 'normal' | 'holiday' | 'workday' | 'muted'
@@ -50,8 +51,6 @@ const text = {
   festivalWiki: '\u8282\u65e5\u767e\u79d1',
   suitable: '\u5b9c',
   avoid: '\u5fcc',
-  suitableText: '\u7ed3\u5a5a \u51fa\u884c \u6253\u626b \u5408\u5a5a\u8ba2\u5a5a \u7b7e\u8ba2\u5408\u540c \u4ea4\u6613 \u4e70\u623f \u5f00\u4e1a \u8ba2\u76df \u52a8\u571f \u8015\u79cd \u5b89\u5e8a \u6302\u533e',
-  avoidText: '\u5b89\u846c \u796d\u7940 \u4f5c\u7076 \u5165\u6b93',
   detail: '\u67e5\u770b\u8be6\u60c5',
   distance: '\u8ddd\u79bb',
   remains: '\u8fd8\u6709',
@@ -239,8 +238,7 @@ function getDisplayText(date: Date, holidayMap: Record<string, HolidayInfo>): st
   return holidayMap[fullDate]?.name ?? festivalMap[monthDay] ?? lunarFallback[(date.getDate() - 1) % lunarFallback.length]
 }
 
-function buildMonthDays(year: number, month: number, holidayMap: Record<string, HolidayInfo>): CalendarDay[] {
-  const today = new Date()
+function buildMonthDays(year: number, month: number, holidayMap: Record<string, HolidayInfo>, today: Date): CalendarDay[] {
   const firstDay = new Date(year, month - 1, 1)
   const startOffset = getMondayFirstWeekday(firstDay)
   const gridStart = new Date(year, month - 1, 1 - startOffset)
@@ -308,23 +306,164 @@ function buildYearWindow(start: number, end: number): number[] {
   return Array.from({ length: end - start + 1 }, (_, index) => start + index)
 }
 
+function getResolvedTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''
+}
+
 function CalendarApp(): React.ReactElement {
-  const now = new Date()
-  const [viewYear, setViewYear] = useState(2026)
-  const [viewMonth, setViewMonth] = useState(4)
-  const [selectedDate, setSelectedDate] = useState(new Date(2026, 3, 22))
+  const calendarWindowRef = useRef<HTMLElement | null>(null)
+  const [now, setNow] = useState(() => new Date())
+  const [viewYear, setViewYear] = useState(() => new Date().getFullYear())
+  const [viewMonth, setViewMonth] = useState(() => new Date().getMonth() + 1)
+  const [selectedDate, setSelectedDate] = useState(() => new Date())
   const [selectedHoliday, setSelectedHoliday] = useState<HolidayKey>('all')
   const [statusMessage, setStatusMessage] = useState('')
   const [yearMenuOpen, setYearMenuOpen] = useState(false)
   const [monthMenuOpen, setMonthMenuOpen] = useState(false)
   const [holidayMenuOpen, setHolidayMenuOpen] = useState(false)
   const [yearWindow, setYearWindow] = useState({ start: currentYear - 4, end: currentYear + 6 })
+  const [almanacRecord, setAlmanacRecord] = useState<AlmanacRecord | null>(null)
+  const previousTodayKeyRef = useRef(formatDate(now))
+  const lastWatchRef = useRef({
+    timestamp: Date.now(),
+    timezoneOffset: now.getTimezoneOffset(),
+    timeZone: getResolvedTimeZone(),
+  })
 
   const holidayMap = useMemo(() => buildHolidayMap(viewYear), [viewYear])
-  const days = useMemo(() => buildMonthDays(viewYear, viewMonth, holidayMap), [holidayMap, viewMonth, viewYear])
+  const days = useMemo(() => buildMonthDays(viewYear, viewMonth, holidayMap, now), [holidayMap, now, viewMonth, viewYear])
   const selectedText = getDisplayText(selectedDate, holidayMap)
   const countdown = getCountdown(selectedDate, holidayMap)
   const visibleYears = useMemo(() => buildYearWindow(yearWindow.start, yearWindow.end), [yearWindow])
+
+  useEffect(() => {
+    let cancelled = false
+    const selectedDateKey = formatDate(selectedDate)
+
+    void window.calendarApi.getAlmanac(selectedDateKey).then((result) => {
+      if (!cancelled) {
+        setAlmanacRecord(result.record)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedDate])
+
+  useEffect(() => {
+    const target = calendarWindowRef.current
+
+    if (!target) {
+      return
+    }
+
+    const reportSize = (): void => {
+      const rect = target.getBoundingClientRect()
+      window.calendarApi.reportCalendarSize({
+        width: Math.ceil(rect.width),
+        height: Math.ceil(rect.height),
+      })
+    }
+
+    const observer = new ResizeObserver(() => {
+      reportSize()
+    })
+
+    observer.observe(target)
+    reportSize()
+
+    return () => {
+      observer.disconnect()
+    }
+  }, [almanacRecord, statusMessage, viewMonth, viewYear, yearMenuOpen, monthMenuOpen, holidayMenuOpen])
+
+  useEffect(() => {
+    return window.calendarApi.onAlmanacUpdated((record) => {
+      if (record === null) {
+        void window.calendarApi.getAlmanac(formatDate(selectedDate)).then((result) => {
+          setAlmanacRecord(result.record)
+        })
+        return
+      }
+
+      if (record.date === formatDate(selectedDate)) {
+        setAlmanacRecord(record)
+      }
+    })
+  }, [selectedDate])
+
+  useEffect(() => {
+    let midnightTimer = 0
+
+    const scheduleMidnightRefresh = (): void => {
+      window.clearTimeout(midnightTimer)
+
+      const current = new Date()
+      const nextMidnight = new Date(current)
+      nextMidnight.setHours(24, 0, 0, 50)
+
+      midnightTimer = window.setTimeout(() => {
+        const nextNow = new Date()
+        lastWatchRef.current = {
+          timestamp: Date.now(),
+          timezoneOffset: nextNow.getTimezoneOffset(),
+          timeZone: getResolvedTimeZone(),
+        }
+        setNow(nextNow)
+        scheduleMidnightRefresh()
+      }, Math.max(100, nextMidnight.getTime() - current.getTime()))
+    }
+
+    const watchdogTimer = window.setInterval(() => {
+      const nextNow = new Date()
+      const currentTimestamp = Date.now()
+      const currentTimeZone = getResolvedTimeZone()
+      const previous = lastWatchRef.current
+      const clockJumped = Math.abs(currentTimestamp - previous.timestamp - 15000) > 4000
+      const timezoneChanged = nextNow.getTimezoneOffset() !== previous.timezoneOffset || currentTimeZone !== previous.timeZone
+      const dayChanged = formatDate(nextNow) !== formatDate(now)
+
+      if (clockJumped || timezoneChanged || dayChanged) {
+        lastWatchRef.current = {
+          timestamp: currentTimestamp,
+          timezoneOffset: nextNow.getTimezoneOffset(),
+          timeZone: currentTimeZone,
+        }
+        setNow(nextNow)
+        scheduleMidnightRefresh()
+      } else {
+        lastWatchRef.current = {
+          timestamp: currentTimestamp,
+          timezoneOffset: nextNow.getTimezoneOffset(),
+          timeZone: currentTimeZone,
+        }
+      }
+    }, 15000)
+
+    scheduleMidnightRefresh()
+
+    return () => {
+      window.clearTimeout(midnightTimer)
+      window.clearInterval(watchdogTimer)
+    }
+  }, [now])
+
+  useEffect(() => {
+    const previousTodayKey = previousTodayKeyRef.current
+    const currentTodayKey = formatDate(now)
+
+    if (previousTodayKey !== currentTodayKey) {
+      setSelectedDate((current) => (formatDate(current) === previousTodayKey ? new Date(now) : current))
+
+      if (viewYear === parseDate(previousTodayKey).getFullYear() && viewMonth === parseDate(previousTodayKey).getMonth() + 1) {
+        setViewYear(now.getFullYear())
+        setViewMonth(now.getMonth() + 1)
+      }
+    }
+
+    previousTodayKeyRef.current = currentTodayKey
+  }, [now, viewMonth, viewYear])
 
   function jumpToHoliday(year: number, key: HolidayKey): boolean {
     const range = getHolidayRange(year, key)
@@ -430,7 +569,7 @@ function CalendarApp(): React.ReactElement {
         setHolidayMenuOpen(false)
       }}
     >
-      <section className="calendar-window">
+      <section ref={calendarWindowRef} className="calendar-window">
         <header className="toolbar">
           <div className="picker holiday-picker" onClick={(event) => event.stopPropagation()}>
             <button
@@ -590,46 +729,47 @@ function CalendarApp(): React.ReactElement {
           </div>
         </div>
 
-        <footer className="detail-panel">
-          <div className="festival-links">
-            <a href="#festival">{text.festivalWiki}</a>
-            <a href="#selected-day">{selectedText}</a>
-            <span aria-hidden="true">?</span>
-          </div>
-
-          <article className="almanac-card">
-            <div className="lunar-summary">
-              <strong>
-                {selectedDate.getMonth() + 1}
-                {text.month} {lunarFallback[(selectedDate.getDate() - 1) % lunarFallback.length]}
-              </strong>
-              <span>
-                {selectedDate.getFullYear()}
-                {text.year} {text.zodiacHorse}
-              </span>
+        {almanacRecord && (
+          <footer className="detail-panel">
+            <div className="festival-links">
+              <a href="#festival">{text.festivalWiki}</a>
+              <a href="#selected-day">{selectedText}</a>
+              <span aria-hidden="true">?</span>
             </div>
 
-            <div className="almanac-lines">
-              <p>
-                <span className="almanac-tag tag-good">{text.suitable}</span>
-                {text.suitableText}
-              </p>
-              <p>
-                <span className="almanac-tag tag-bad">{text.avoid}</span>
-                {text.avoidText}
-              </p>
+            <article className="almanac-card">
+              <div className="lunar-summary">
+                <strong>
+                  {almanacRecord.lunarMonthLabel || `${selectedDate.getMonth() + 1}${text.month}`}{' '}
+                  {almanacRecord.lunarDayLabel || lunarFallback[(selectedDate.getDate() - 1) % lunarFallback.length]}
+                </strong>
+                <span>
+                  {almanacRecord.ganzhiYear || `${selectedDate.getFullYear()}${text.year}`} {almanacRecord.zodiac || text.zodiacHorse}
+                </span>
+              </div>
+
+              <div className="almanac-lines">
+                <p>
+                  <span className="almanac-tag tag-good">{text.suitable}</span>
+                  {almanacRecord.good}
+                </p>
+                <p>
+                  <span className="almanac-tag tag-bad">{text.avoid}</span>
+                  {almanacRecord.bad}
+                </p>
+              </div>
+
+              <button className="detail-more" aria-label={text.detail}>
+                {'>'}
+              </button>
+            </article>
+
+            <div className="countdown-line">
+              <span aria-hidden="true">o</span>
+              {text.distance} {countdown.name} {text.remains} <strong>{countdown.days}</strong> {text.days}
             </div>
-
-            <button className="detail-more" aria-label={text.detail}>
-              {'>'}
-            </button>
-          </article>
-
-          <div className="countdown-line">
-            <span aria-hidden="true">o</span>
-            {text.distance} {countdown.name} {text.remains} <strong>{countdown.days}</strong> {text.days}
-          </div>
-        </footer>
+          </footer>
+        )}
       </section>
     </main>
   )
