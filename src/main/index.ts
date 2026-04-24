@@ -446,7 +446,7 @@ function createCalendarWindow(): void {
     resizable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    backgroundColor: '#f6f9fc',
+    backgroundColor: '#ffffff',
     autoHideMenuBar: true,
     show: false,
     title: 'Calendar',
