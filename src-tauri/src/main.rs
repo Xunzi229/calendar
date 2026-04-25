@@ -27,11 +27,13 @@ const DEFAULT_WINDOW_HEIGHT: i32 = 560;
 const SETTINGS_WINDOW_WIDTH: i32 = 420;
 const SETTINGS_WINDOW_HEIGHT: i32 = 220;
 const FOCUS_HIDE_DELAY_MILLIS: u64 = 350;
+const TRAY_TOGGLE_SUPPRESS_MILLIS: u64 = 250;
 
 struct AppState {
   config_path: PathBuf,
   database_path: PathBuf,
   last_main_window_shown_at: Mutex<Option<Instant>>,
+  last_main_window_hidden_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -228,6 +230,7 @@ fn main() {
               .unwrap_or(true);
 
             if should_hide {
+              record_main_window_hidden_at(&app_handle);
               let _ = window_handle.hide();
             }
           }
@@ -256,6 +259,7 @@ fn initialize_state(app: &App) -> Result<AppState, Box<dyn std::error::Error>> {
     config_path: app_dir.join("calendar.config.json"),
     database_path: app_dir.join("calendar-cache.sqlite"),
     last_main_window_shown_at: Mutex::new(None),
+    last_main_window_hidden_at: Mutex::new(None),
   };
 
   initialize_database(&state.database_path)?;
@@ -341,6 +345,7 @@ fn show_main_window(app: &AppHandle) {
 
 fn hide_main_window(app: &AppHandle) {
   if let Some(window) = app.get_webview_window("main") {
+    record_main_window_hidden_at(app);
     let _ = window.hide();
   }
 }
@@ -378,9 +383,23 @@ fn toggle_main_window(app: &AppHandle) {
   if let Some(window) = app.get_webview_window("main") {
     match window.is_visible() {
       Ok(true) => {
+        record_main_window_hidden_at(app);
         let _ = window.hide();
       }
       _ => {
+        let hidden_too_recently = app
+          .state::<Arc<AppState>>()
+          .last_main_window_hidden_at
+          .lock()
+          .ok()
+          .and_then(|last| *last)
+          .map(|instant| instant.elapsed() < Duration::from_millis(TRAY_TOGGLE_SUPPRESS_MILLIS))
+          .unwrap_or(false);
+
+        if hidden_too_recently {
+          return;
+        }
+
         position_main_window(&window);
         let _ = window.show();
         let _ = window.set_focus();
@@ -392,6 +411,12 @@ fn toggle_main_window(app: &AppHandle) {
 
 fn position_main_window(window: &WebviewWindow) {
   position_window_bottom_right(window, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+}
+
+fn record_main_window_hidden_at(app: &AppHandle) {
+  if let Ok(mut last_hidden_at) = app.state::<Arc<AppState>>().last_main_window_hidden_at.lock() {
+    *last_hidden_at = Some(Instant::now());
+  }
 }
 
 fn position_window_bottom_right(window: &WebviewWindow, fallback_width: i32, fallback_height: i32) {
