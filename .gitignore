@@ -5,6 +5,7 @@ node_modules/
 dist/
 release/
 out/
+src-tauri/target/
 
 # Vite / Electron caches
 .vite/

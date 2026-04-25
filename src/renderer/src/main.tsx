@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { desktopApi } from './api/desktop'
 import type { AlmanacRecord } from '../../shared/almanac/types'
 import type { ClockSnapshot } from '../../shared/clock/types'
 import './styles.css'
@@ -49,16 +50,22 @@ const text = {
   rest: '\u4f11',
   work: '\u73ed',
   currentDay: '\u4eca',
-  festivalWiki: '\u8282\u65e5\u767e\u79d1',
   suitable: '\u5b9c',
   avoid: '\u5fcc',
-  detail: '\u67e5\u770b\u8be6\u60c5',
   distance: '\u8ddd\u79bb',
   remains: '\u8fd8\u6709',
   days: '\u5929',
   nextHoliday: '\u4e0b\u4e00\u4e2a\u8282\u65e5',
   noHolidayData: '\u5f53\u524d\u5e74\u4efd\u6682\u65e0\u8be5\u8282\u5047\u65e5\u6570\u636e',
   zodiacHorse: '\u9a6c',
+  settingsTitle: '\u914d\u7f6e TianAPI Key',
+  apiKeyLabel: 'TianAPI Key',
+  save: '\u4fdd\u5b58',
+  clear: '\u6e05\u9664',
+  close: '\u5173\u95ed',
+  apiKeySaved: 'TianAPI Key \u5df2\u4fdd\u5b58',
+  apiKeyCleared: 'TianAPI Key \u5df2\u6e05\u9664',
+  apiKeyHint: '\u672a\u914d\u7f6e\u6216 Key \u5931\u6548\u65f6\uff0c\u9ec4\u5386\u9762\u677f\u4f1a\u81ea\u52a8\u9690\u85cf\u3002',
 }
 
 const weekDays = ['\u4e00', '\u4e8c', '\u4e09', '\u56db', '\u4e94', '\u516d', '\u65e5']
@@ -307,12 +314,85 @@ function buildYearWindow(start: number, end: number): number[] {
   return Array.from({ length: end - start + 1 }, (_, index) => start + index)
 }
 
-function getResolvedTimeZone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''
-}
-
 function toClockDate(snapshot: ClockSnapshot): Date {
   return new Date(snapshot.iso)
+}
+
+function SettingsApp(): React.ReactElement {
+  const [apiKey, setApiKey] = useState('')
+  const [message, setMessage] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+
+    void desktopApi.getApiKey().then((value) => {
+      if (!cancelled) {
+        setApiKey(value)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  async function saveApiKey(): Promise<void> {
+    setBusy(true)
+    setMessage('')
+
+    try {
+      await desktopApi.setApiKey(apiKey)
+      setMessage(apiKey.trim() ? text.apiKeySaved : text.apiKeyCleared)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function clearApiKey(): Promise<void> {
+    setBusy(true)
+    setMessage('')
+
+    try {
+      setApiKey('')
+      await desktopApi.setApiKey('')
+      setMessage(text.apiKeyCleared)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="settings-shell">
+      <section className="settings-window">
+        <div className="settings-panel__header">
+          <strong>{text.settingsTitle}</strong>
+          <span>{text.apiKeyHint}</span>
+        </div>
+        <label className="settings-field">
+          <span>{text.apiKeyLabel}</span>
+          <input
+            className="settings-input"
+            value={apiKey}
+            placeholder="请输入 TianAPI Key"
+            onChange={(event) => setApiKey(event.target.value)}
+          />
+        </label>
+        <div className="settings-actions">
+          <button className="settings-button" disabled={busy} onClick={() => void clearApiKey()}>
+            {text.clear}
+          </button>
+          <button className="settings-button primary" disabled={busy} onClick={() => void saveApiKey()}>
+            {text.save}
+          </button>
+          <button className="settings-button" disabled={busy} onClick={() => void desktopApi.closeCurrentWindow()}>
+            {text.close}
+          </button>
+        </div>
+        {message && <p className="settings-feedback">{message}</p>}
+      </section>
+    </main>
+  )
 }
 
 function CalendarApp(): React.ReactElement {
@@ -337,6 +417,21 @@ function CalendarApp(): React.ReactElement {
   const countdown = getCountdown(selectedDate, holidayMap)
   const visibleYears = useMemo(() => buildYearWindow(yearWindow.start, yearWindow.end), [yearWindow])
 
+  function refreshAlmanac(date: Date): void {
+    void desktopApi.getAlmanac(formatDate(date)).then((result) => {
+      setAlmanacRecord(result.record)
+    })
+  }
+
+  function jumpToDate(date: Date): void {
+    setViewYear(date.getFullYear())
+    setViewMonth(date.getMonth() + 1)
+    setSelectedDate(new Date(date.getFullYear(), date.getMonth(), date.getDate()))
+    setSelectedHoliday('all')
+    setStatusMessage('')
+    ensureYearVisible(date.getFullYear())
+  }
+
   useEffect(() => {
     let cancelled = false
     let pollTimer = 0
@@ -356,23 +451,23 @@ function CalendarApp(): React.ReactElement {
       }
     }
 
-    void window.calendarApi.getClockSnapshot().then((snapshot) => {
+    void desktopApi.getClockSnapshot().then((snapshot) => {
       if (!cancelled) {
         syncClockSnapshot(snapshot)
       }
     })
 
-    const unsubscribe = window.calendarApi.onClockChanged((snapshot) => {
+    const unsubscribe = desktopApi.onClockChanged((snapshot) => {
       syncClockSnapshot(snapshot)
     })
 
     pollTimer = window.setInterval(() => {
-      void window.calendarApi.getClockSnapshot().then((snapshot) => {
+      void desktopApi.getClockSnapshot().then((snapshot) => {
         if (!cancelled) {
           syncClockSnapshot(snapshot)
         }
       })
-    }, 250)
+    }, 30000)
 
     return () => {
       cancelled = true
@@ -385,7 +480,7 @@ function CalendarApp(): React.ReactElement {
     let cancelled = false
     const selectedDateKey = formatDate(selectedDate)
 
-    void window.calendarApi.getAlmanac(selectedDateKey).then((result) => {
+    void desktopApi.getAlmanac(selectedDateKey).then((result) => {
       if (!cancelled) {
         setAlmanacRecord(result.record)
       }
@@ -405,7 +500,7 @@ function CalendarApp(): React.ReactElement {
 
     const reportSize = (): void => {
       const rect = target.getBoundingClientRect()
-      window.calendarApi.reportCalendarSize({
+      void desktopApi.reportCalendarSize({
         width: Math.ceil(rect.width),
         height: Math.ceil(rect.height),
       })
@@ -424,11 +519,9 @@ function CalendarApp(): React.ReactElement {
   }, [almanacRecord, statusMessage, viewMonth, viewYear, yearMenuOpen, monthMenuOpen, holidayMenuOpen])
 
   useEffect(() => {
-    return window.calendarApi.onAlmanacUpdated((record) => {
+    return desktopApi.onAlmanacUpdated((record) => {
       if (record === null) {
-        void window.calendarApi.getAlmanac(formatDate(selectedDate)).then((result) => {
-          setAlmanacRecord(result.record)
-        })
+        refreshAlmanac(selectedDate)
         return
       }
 
@@ -437,6 +530,18 @@ function CalendarApp(): React.ReactElement {
       }
     })
   }, [selectedDate])
+
+  useEffect(() => {
+    return desktopApi.onCalendarShown(() => {
+      void desktopApi.getClockSnapshot().then((snapshot) => {
+        lastClockSnapshotRef.current = snapshot
+        const today = toClockDate(snapshot)
+        setNow(today)
+        jumpToDate(today)
+        refreshAlmanac(today)
+      })
+    })
+  }, [])
 
   useEffect(() => {
     const previousTodayKey = previousTodayKeyRef.current
@@ -530,12 +635,7 @@ function CalendarApp(): React.ReactElement {
   }
 
   function jumpToday(): void {
-    setViewYear(now.getFullYear())
-    setViewMonth(now.getMonth() + 1)
-    setSelectedDate(new Date(now.getFullYear(), now.getMonth(), now.getDate()))
-    setSelectedHoliday('all')
-    setStatusMessage('')
-    ensureYearVisible(now.getFullYear())
+    jumpToDate(now)
   }
 
   function selectDay(day: CalendarDay): void {
@@ -560,51 +660,57 @@ function CalendarApp(): React.ReactElement {
     >
       <section ref={calendarWindowRef} className="calendar-window">
         <header className="toolbar">
-          <div className="picker holiday-picker" onClick={(event) => event.stopPropagation()}>
-            <button
-              aria-expanded={holidayMenuOpen}
-              aria-label={text.allHolidays}
-              className="control picker-button holiday-control"
-              onClick={() => {
-                setHolidayMenuOpen((open) => !open)
-                setYearMenuOpen(false)
-                setMonthMenuOpen(false)
-              }}
-            >
-              <span>{holidayOptions.find((option) => option.key === selectedHoliday)?.label ?? text.allHolidays}</span>
-              <span className="select-caret" aria-hidden="true" />
-            </button>
-            {holidayMenuOpen && (
-              <div className="picker-menu holiday-menu">
-                {holidayOptions.map((option) => {
-                  const disabled = option.key !== 'all' && !getHolidayRange(viewYear, option.key)
+          <div className="toolbar-start" onClick={(event) => event.stopPropagation()}>
+            <div className="picker holiday-picker">
+              <button
+                aria-expanded={holidayMenuOpen}
+                aria-label={text.allHolidays}
+                className="control picker-button holiday-control"
+                onClick={() => {
+                  setHolidayMenuOpen((open) => !open)
+                  setYearMenuOpen(false)
+                  setMonthMenuOpen(false)
+                }}
+              >
+                <span>{holidayOptions.find((option) => option.key === selectedHoliday)?.label ?? text.allHolidays}</span>
+                <span className="select-caret" aria-hidden="true" />
+              </button>
+              {holidayMenuOpen && (
+                <div className="picker-menu holiday-menu">
+                  {holidayOptions.map((option) => {
+                    const disabled = option.key !== 'all' && !getHolidayRange(viewYear, option.key)
 
-                  return (
-                    <button
-                      key={option.key}
-                      className={classNames('picker-option', option.key === selectedHoliday && 'is-active')}
-                      disabled={disabled}
-                      onClick={() => {
-                        if (!disabled) {
-                          changeHoliday(option.key)
-                        }
-                      }}
-                    >
-                      {option.label}
-                    </button>
-                  )
-                })}
-              </div>
-            )}
+                    return (
+                      <button
+                        key={option.key}
+                        className={classNames('picker-option', option.key === selectedHoliday && 'is-active')}
+                        disabled={disabled}
+                        onClick={() => {
+                          if (!disabled) {
+                            changeHoliday(option.key)
+                          }
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
           </div>
 
-          <div className="toolbar-center">
-            <div className="year-picker" onClick={(event) => event.stopPropagation()}>
+          <div className="toolbar-center" onClick={(event) => event.stopPropagation()}>
+            <div className="year-picker">
               <button
                 aria-expanded={yearMenuOpen}
                 aria-label={text.year}
                 className="control year-picker-button"
-                onClick={() => setYearMenuOpen((open) => !open)}
+                onClick={() => {
+                  setYearMenuOpen((open) => !open)
+                  setMonthMenuOpen(false)
+                  setHolidayMenuOpen(false)
+                }}
               >
                 <span>
                   {viewYear}
@@ -630,7 +736,7 @@ function CalendarApp(): React.ReactElement {
             <button className="arrow-button" aria-label={text.previousMonth} onClick={() => changeMonth(-1)}>
               {'<'}
             </button>
-            <div className="picker" onClick={(event) => event.stopPropagation()}>
+            <div className="picker">
               <button
                 aria-expanded={monthMenuOpen}
                 aria-label={text.month}
@@ -638,6 +744,7 @@ function CalendarApp(): React.ReactElement {
                 onClick={() => {
                   setMonthMenuOpen((open) => !open)
                   setYearMenuOpen(false)
+                  setHolidayMenuOpen(false)
                 }}
               >
                 <span>
@@ -721,9 +828,7 @@ function CalendarApp(): React.ReactElement {
         {almanacRecord && (
           <footer className="detail-panel">
             <div className="festival-links">
-              <a href="#festival">{text.festivalWiki}</a>
               <a href="#selected-day">{selectedText}</a>
-              <span aria-hidden="true">?</span>
             </div>
 
             <article className="almanac-card">
@@ -747,10 +852,6 @@ function CalendarApp(): React.ReactElement {
                   {almanacRecord.bad}
                 </p>
               </div>
-
-              <button className="detail-more" aria-label={text.detail}>
-                {'>'}
-              </button>
             </article>
 
             <div className="countdown-line">
@@ -764,4 +865,6 @@ function CalendarApp(): React.ReactElement {
   )
 }
 
-createRoot(document.getElementById('root')!).render(<CalendarApp />)
+const isSettingsView = new URLSearchParams(window.location.search).get('view') === 'settings'
+
+createRoot(document.getElementById('root')!).render(isSettingsView ? <SettingsApp /> : <CalendarApp />)
