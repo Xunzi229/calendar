@@ -492,6 +492,18 @@ function CalendarApp(): React.ReactElement {
   }, [selectedDate])
 
   useEffect(() => {
+    const preventContextMenu = (event: MouseEvent): void => {
+      event.preventDefault()
+    }
+
+    document.addEventListener('contextmenu', preventContextMenu)
+
+    return () => {
+      document.removeEventListener('contextmenu', preventContextMenu)
+    }
+  }, [])
+
+  useEffect(() => {
     const target = calendarWindowRef.current
 
     if (!target) {
